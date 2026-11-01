@@ -1,0 +1,10 @@
+id = "changer"
+name = "Drop Changer"
+icon = "swap"
+size = "wide"
+run = ["python", "main.py"]
+hotkey = "ctrl+alt+KeyD"
+accepts_files = true
+description = "Universal drag & drop converter for the notch: convert files, browser selections, and images into Word, PDF, Excel, JPEG, PNG, TXT, and HTML."
+author = "Deepak"
+version = "1.0.0"
