@@ -4,13 +4,14 @@ Provides seamless Drag & Drop support from Web Browsers (Chrome, Microsoft Edge,
 Firefox), desktop applications, document editors, and Windows File Explorer directly
 into Nook Notch.
 
-Key Capabilities:
-1. Browser text selection (plain text, formatted text, HTML).
-2. Browser images (JPEG, PNG, WebP, GIF, SVG, data URIs, DIB bitmaps).
-3. Browser hyperlinks and address bar URLs.
-4. Windows File Explorer local files (single or multiple).
-5. Zero-Clash Architecture: Window is 100% invisible and click-through (HTTRANSPARENT)
-   when not dragging; only activates as an OLE IDropTarget during active mouse drag.
+Fixes Applied:
+- BUG 1: Tight 200x36 geometry matching notch pill; full click pass-through
+  (WM_LBUTTONDOWN forwarded to window beneath) so normal clicks NEVER activate Dropper.
+- BUG 2: Dynamic expansion only when Dropper page is open; never forces pinned state;
+  calls app.open_page() (never app.show()).
+- BUG 3: Payload validation (can_accept_payload) and drop effect negotiation
+  (COPY, MOVE, LINK) to eliminate blocked cursor; unified image pipeline supporting
+  WEBP, JPEG, PNG, GIF, BMP, TIFF, SVG, data URIs, and DIB bitmaps with alpha preservation.
 """
 
 import os
@@ -46,6 +47,15 @@ CF_URL_A = win32clipboard.RegisterClipboardFormat("UniformResourceLocator")
 CF_FILEDESCW = win32clipboard.RegisterClipboardFormat("FileGroupDescriptorW")
 CF_FILECONTENTS = win32clipboard.RegisterClipboardFormat("FileContents")
 
+# Standard Windows OLE Drop Effects
+DROPEFFECT_NONE = 0
+DROPEFFECT_COPY = 1
+DROPEFFECT_MOVE = 2
+DROPEFFECT_LINK = 4
+
+class POINT(ctypes.Structure):
+    _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
 
 # ---------------------------------------------------------------------------
 # Cache Directory for Web Assets
@@ -58,18 +68,33 @@ def get_cache_dir():
 
 
 # ---------------------------------------------------------------------------
-# Mouse Drag State Detection
+# Click Pass-Through Helper (Prevents Intercepting Arbitrary Screen Clicks)
 # ---------------------------------------------------------------------------
 
-def is_mouse_dragging():
-    """Returns True if the left or right mouse button is currently held down."""
-    l_down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
-    r_down = bool(user32.GetAsyncKeyState(0x02) & 0x8000)
-    return l_down or r_down
+def forward_click_to_underneath(hwnd, msg, wparam, lparam):
+    """
+    Passes mouse click messages through to the actual window underneath
+    Dropper's drop target so normal desktop and Nook navigation clicks
+    are never blocked or falsely attributed to Dropper.
+    """
+    pt = POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+
+    # Temporarily hide our window to find the real window beneath the cursor
+    win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+    hwnd_under = user32.WindowFromPoint(pt)
+    win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+
+    if hwnd_under and hwnd_under != hwnd:
+        user32.ScreenToClient(hwnd_under, ctypes.byref(pt))
+        target_lparam = win32api.MAKELONG(pt.x, pt.y)
+        user32.PostMessageW(hwnd_under, msg, wparam, target_lparam)
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
-# DIB Bitmap Conversion
+# DIB Bitmap Conversion & Image Normalization
 # ---------------------------------------------------------------------------
 
 def dib_bytes_to_image(dib_data):
@@ -97,7 +122,7 @@ def dib_bytes_to_image(dib_data):
 def download_web_resource(url, cache_dir, timeout=8):
     """
     Downloads an image or file from a URL to the local cache directory.
-    Validates URL safety and returns the local file path.
+    Validates URL scheme and returns the local file path.
     """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ('http', 'https'):
@@ -125,7 +150,7 @@ def download_web_resource(url, cache_dir, timeout=8):
 
 
 # ---------------------------------------------------------------------------
-# Format Inspection Helper
+# Format Inspection & Acceptance Check
 # ---------------------------------------------------------------------------
 
 def inspect_available_formats(dataObject):
@@ -137,7 +162,10 @@ def inspect_available_formats(dataObject):
             fetc = enum.Next(1)
             if not fetc:
                 break
-            cf = fetc[0][0]
+            item = fetc[0]
+            cf = item[0] if isinstance(item, (tuple, list)) else item
+            if isinstance(cf, (tuple, list)):
+                cf = cf[0]
             try:
                 name = win32clipboard.GetClipboardFormatName(cf)
             except Exception:
@@ -155,6 +183,23 @@ def inspect_available_formats(dataObject):
     except Exception:
         pass
     return formats
+
+
+def can_accept_payload(dataObject):
+    """
+    Validates whether the dragged dataObject contains any supported format:
+    Files, Unicode/Plain Text, HTML, URLs, or Bitmaps/Images.
+    Used for drop effect negotiation to eliminate the blocked cursor.
+    """
+    formats = inspect_available_formats(dataObject)
+    for f in formats:
+        f_upper = f.upper()
+        if any(key in f_upper for key in (
+            "HDROP", "FILE", "TEXT", "HTML", "URL", "LOCATOR", "UNIFORM",
+            "DIB", "BITMAP", "IMAGE", "URI", "LINK", "SHELL"
+        )):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -211,21 +256,20 @@ def parse_dropped_data_object(dataObject, diag=None):
                 try:
                     header, b64_data = img_src.split(",", 1)
                     img_bytes = base64.b64decode(b64_data)
-                    ext = ".png"
-                    if "jpeg" in header or "jpg" in header: ext = ".jpg"
-                    elif "webp" in header: ext = ".webp"
+                    # Verify with PIL to get actual format (WEBP, JPEG, PNG, etc.)
+                    with Image.open(BytesIO(img_bytes)) as im:
+                        width, height = im.size
+                        im_fmt = im.format or "PNG"
+                    ext = f".{im_fmt.lower()}"
+                    if ext == ".jpeg": ext = ".jpg"
                     cached_file = os.path.join(cache_dir, f"browser_image_{int(time.time()*1000)}{ext}")
                     with open(cached_file, "wb") as f:
                         f.write(img_bytes)
-                    # Verify with PIL
-                    with Image.open(cached_file) as im:
-                        width, height = im.size
-                        im_fmt = im.format
                     return {
                         "kind": "image",
                         "path": cached_file,
-                        "source": "Browser Data Image",
-                        "name": f"web_image_{width}x{height}",
+                        "source": f"Browser Web Image ({im_fmt})",
+                        "name": f"web_{im_fmt.lower()}_{width}x{height}",
                         "dimensions": (width, height),
                         "format": im_fmt
                     }
@@ -239,13 +283,13 @@ def parse_dropped_data_object(dataObject, diag=None):
                     if cached_file and os.path.exists(cached_file):
                         with Image.open(cached_file) as im:
                             width, height = im.size
-                            im_fmt = im.format
+                            im_fmt = im.format or "PNG"
                         clean_name = re.sub(r'[^a-zA-Z0-9_-]', '_', Path(urllib.parse.urlparse(img_src).path).stem or "browser_image")[:25]
                         return {
                             "kind": "image",
                             "path": cached_file,
                             "url": img_src,
-                            "source": "Browser Web Image",
+                            "source": f"Browser Web Image ({im_fmt})",
                             "name": clean_name,
                             "dimensions": (width, height),
                             "format": im_fmt
@@ -277,7 +321,7 @@ def parse_dropped_data_object(dataObject, diag=None):
 
     if url_text and url_text.startswith(('http://', 'https://')):
         path_lower = urllib.parse.urlparse(url_text).path.lower()
-        is_img_ext = any(path_lower.endswith(e) for e in ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.svg'))
+        is_img_ext = any(path_lower.endswith(e) for e in ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.svg', '.tiff', '.avif'))
         is_doc_ext = any(path_lower.endswith(e) for e in ('.pdf', '.docx', '.xlsx', '.csv', '.txt'))
 
         if is_img_ext or is_doc_ext:
@@ -287,13 +331,13 @@ def parse_dropped_data_object(dataObject, diag=None):
                     if is_img_ext:
                         with Image.open(cached_file) as im:
                             w, h = im.size
-                            im_fmt = im.format
+                            im_fmt = im.format or "PNG"
                         clean_name = Path(cached_file).stem
                         return {
                             "kind": "image",
                             "path": cached_file,
                             "url": url_text,
-                            "source": "Browser Image URL",
+                            "source": f"Browser Image URL ({im_fmt})",
                             "name": clean_name,
                             "dimensions": (w, h),
                             "format": im_fmt
@@ -339,31 +383,37 @@ def parse_dropped_data_object(dataObject, diag=None):
         except Exception:
             pass
 
-    # 5. Check for CF_UNICODETEXT (Selected text from Chrome, Edge, Firefox, or any text editor)
-    try:
-        fetc = (win32con.CF_UNICODETEXT, None, pythoncom.DVASPECT_CONTENT, -1, pythoncom.TYMED_HGLOBAL)
-        stg = dataObject.GetData(fetc)
-        if stg and stg.data:
-            text = stg.data.decode("utf-16le", errors="ignore").rstrip("\x00").strip()
-            if text:
-                if text.startswith(('http://', 'https://')):
+    # 5. Check for CF_UNICODETEXT / CF_TEXT (Selected text from Chrome, Edge, Firefox, or any text editor)
+    for text_fmt in (win32con.CF_UNICODETEXT, win32con.CF_TEXT):
+        try:
+            fetc = (text_fmt, None, pythoncom.DVASPECT_CONTENT, -1, pythoncom.TYMED_HGLOBAL)
+            stg = dataObject.GetData(fetc)
+            if stg and stg.data:
+                if text_fmt == win32con.CF_UNICODETEXT:
+                    text = stg.data.decode("utf-16le", errors="ignore").rstrip("\x00").strip()
+                else:
+                    text = stg.data.decode("utf-8", errors="replace").rstrip("\x00").strip()
+                if text:
+                    # Normalize line endings
+                    text = text.replace("\r\n", "\n").replace("\r", "\n")
+                    if text.startswith(('http://', 'https://')):
+                        return {
+                            "kind": "url",
+                            "data": text,
+                            "source": "Browser Link",
+                            "name": "web_link",
+                            "url": text
+                        }
+                    first_ln = text.splitlines()[0][:30].strip()
+                    clean_name = re.sub(r'[^a-zA-Z0-9_-]', '_', first_ln)[:20] or "browser_text"
                     return {
-                        "kind": "url",
+                        "kind": "text",
                         "data": text,
-                        "source": "Browser Link",
-                        "name": "web_link",
-                        "url": text
+                        "source": "Browser Selected Text",
+                        "name": clean_name
                     }
-                first_ln = text.splitlines()[0][:30].strip()
-                clean_name = re.sub(r'[^a-zA-Z0-9_-]', '_', first_ln)[:20] or "browser_text"
-                return {
-                    "kind": "text",
-                    "data": text,
-                    "source": "Browser Selected Text",
-                    "name": clean_name
-                }
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     # 6. Check for HTML snippet text (if unicode text was empty but HTML is available)
     if html_raw:
@@ -379,11 +429,11 @@ def parse_dropped_data_object(dataObject, diag=None):
                 "name": clean_name
             }
 
-    return None
+    return {"kind": "unsupported", "message": "The dropped item could not be recognized as text, image, URL, or file."}
 
 
 # ---------------------------------------------------------------------------
-# COM IDropTarget Implementation
+# COM IDropTarget Implementation (With Proper Effect Negotiation)
 # ---------------------------------------------------------------------------
 
 class NotchDropTargetCOM:
@@ -394,18 +444,34 @@ class NotchDropTargetCOM:
         self.on_hover_cb = on_hover_cb
         self.diag = diag or DiagnosticLogger()
         self.is_hovered = False
+        self.current_effect = DROPEFFECT_NONE
 
     def DragEnter(self, dataObject, keyState, pt, effect):
         self.is_hovered = True
         formats = inspect_available_formats(dataObject)
         self.diag.log_drag_enter(formats)
 
-        if self.on_hover_cb:
-            self.on_hover_cb(True, formats)
-        return win32con.DROPEFFECT_COPY
+        # Validate that the payload can actually be accepted
+        if can_accept_payload(dataObject):
+            # Negotiate supported effect with source application
+            if effect & DROPEFFECT_COPY:
+                self.current_effect = DROPEFFECT_COPY
+            elif effect & DROPEFFECT_MOVE:
+                self.current_effect = DROPEFFECT_MOVE
+            elif effect & DROPEFFECT_LINK:
+                self.current_effect = DROPEFFECT_LINK
+            else:
+                self.current_effect = DROPEFFECT_COPY
+
+            if self.on_hover_cb:
+                self.on_hover_cb(True, formats)
+            return self.current_effect
+        else:
+            self.current_effect = DROPEFFECT_NONE
+            return DROPEFFECT_NONE
 
     def DragOver(self, keyState, pt, effect):
-        return win32con.DROPEFFECT_COPY
+        return self.current_effect
 
     def DragLeave(self):
         self.is_hovered = False
@@ -428,7 +494,7 @@ class NotchDropTargetCOM:
         except Exception as e:
             self.diag.log_drop(formats, error=e)
 
-        return win32con.DROPEFFECT_COPY
+        return self.current_effect
 
 
 # ---------------------------------------------------------------------------
@@ -437,10 +503,12 @@ class NotchDropTargetCOM:
 
 class NotchDropZoneWindow:
     """
-    Invisible, zero-clash drop zone positioned exactly over the notch pill.
-    When idle: 100% invisible (alpha=1) and click-through (HTTRANSPARENT).
-    During drag: Detects mouse drag, activates OLE IDropTarget, smoothly opens
-    Nook in mid-air, and delivers browser text, images, URLs, and files to the plugin.
+    Sleek, zero-clash drop zone positioned strictly over Nook's notch pill.
+    When idle: 100% invisible (alpha=1).
+    On click: Forwards clicks to the window beneath via forward_click_to_underneath(),
+    never activates Dropper, and never interferes with other Nook modules or tabs.
+    On drag: Detects OLE drag enter, displays subtle glowing indicator, negotiates
+    drop effect, and delivers browser text, images, URLs, and files to the plugin.
     """
 
     def __init__(self, on_item_received, on_open_request=None, app_logger=None):
@@ -451,12 +519,21 @@ class NotchDropZoneWindow:
         self.hovered = False
         self.hover_formats = []
         self._thread = None
-        self.width = 460
-        self.height = 56
+        # Compact initial size strictly matching Nook's collapsed notch pill (200x36)
+        self.width = 200
+        self.height = 36
+        self.is_expanded = False
 
     def start(self):
         self._thread = threading.Thread(target=self._run_window, daemon=True)
         self._thread.start()
+
+    def set_expanded(self, expanded):
+        """Expands drop zone when Dropper page is open, shrinks back to notch pill when closed."""
+        if self.hwnd and self.is_expanded != expanded:
+            self.is_expanded = expanded
+            # Post custom message to resize on the window thread
+            win32gui.PostMessage(self.hwnd, win32con.WM_USER + 1, 1 if expanded else 0, 0)
 
     def _on_hover_change(self, is_hovered, formats):
         self.hovered = is_hovered
@@ -464,21 +541,18 @@ class NotchDropZoneWindow:
 
         if self.hwnd:
             if is_hovered:
-                # Smoothly open Nook notch so user sees the page slide down in mid-air!
+                # Open page without pinning so user sees Dropper slide open
                 if self.on_open_request:
                     self.on_open_request()
-                # Show subtle glowing glass indicator
-                win32gui.SetLayeredWindowAttributes(self.hwnd, 0, 220, win32con.LWA_ALPHA)
-                win32gui.InvalidateRect(self.hwnd, None, True)
+                # Dynamically expand and show glowing indicator on window thread
+                win32gui.PostMessage(self.hwnd, win32con.WM_USER + 1, 1, 0)
             else:
-                # Restore to 100% invisible
-                win32gui.SetLayeredWindowAttributes(self.hwnd, 0, 1, win32con.LWA_ALPHA)
-                win32gui.InvalidateRect(self.hwnd, None, True)
+                # Restore to 200x36 notch pill and 100% invisible on window thread
+                win32gui.PostMessage(self.hwnd, win32con.WM_USER + 1, 0, 0)
 
     def _on_drop_delivered(self, parsed_item):
         if self.hwnd:
-            win32gui.SetLayeredWindowAttributes(self.hwnd, 0, 1, win32con.LWA_ALPHA)
-            win32gui.InvalidateRect(self.hwnd, None, True)
+            win32gui.PostMessage(self.hwnd, win32con.WM_USER + 1, 0, 0)
 
         if self.on_open_request:
             self.on_open_request()
@@ -493,39 +567,64 @@ class NotchDropZoneWindow:
         y = 0
 
         def wnd_proc(hwnd, msg, wparam, lparam):
-            if msg == win32con.WM_NCHITTEST:
-                # Only accept hit-testing when a mouse drag is actively in progress!
-                # When normal mouse interaction occurs (clicks, hovers), return HTTRANSPARENT
-                # so everything passes through to Nook without interception!
-                if is_mouse_dragging():
-                    return win32con.HTCLIENT
-                return win32con.HTTRANSPARENT
+            if msg in (
+                win32con.WM_LBUTTONDOWN, win32con.WM_LBUTTONUP,
+                win32con.WM_RBUTTONDOWN, win32con.WM_RBUTTONUP,
+                win32con.WM_MBUTTONDOWN, win32con.WM_MBUTTONUP
+            ):
+                # Never intercept user clicks! Forward immediately to window underneath
+                forward_click_to_underneath(hwnd, msg, wparam, lparam)
+                return 0
+
+            elif msg == win32con.WM_MOUSEACTIVATE:
+                # Tell Windows never to activate this drop zone on mouse click
+                return win32con.MA_NOACTIVATEANDEAT
+
+            elif msg == win32con.WM_NCHITTEST:
+                # Accept hit testing for OLE IDropTarget
+                return win32con.HTCLIENT
+
+            elif msg == (win32con.WM_USER + 1):
+                # Resize drop zone dynamically based on whether Dropper is drag-hovered
+                sw = win32api.GetSystemMetrics(0)
+                if wparam == 1:
+                    self.width = 440
+                    self.height = 260
+                    wx = (sw - 440) // 2
+                    win32gui.SetWindowPos(hwnd, 0, wx, 0, 440, 260, win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+                    win32gui.SetLayeredWindowAttributes(hwnd, 0, 220, win32con.LWA_ALPHA)
+                    win32gui.InvalidateRect(hwnd, None, True)
+                else:
+                    self.width = 200
+                    self.height = 36
+                    wx = (sw - 200) // 2
+                    win32gui.SetWindowPos(hwnd, 0, wx, 0, 200, 36, win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+                    win32gui.SetLayeredWindowAttributes(hwnd, 0, 1, win32con.LWA_ALPHA)
+                    win32gui.InvalidateRect(hwnd, None, True)
+                return 0
 
             elif msg == win32con.WM_PAINT:
                 hdc, ps = win32gui.BeginPaint(hwnd)
                 rect = win32gui.GetClientRect(hwnd)
 
                 if self.hovered:
-                    # Sleek glowing halo indicator during active drag-hover
-                    # Glass dark pill with accent border
-                    brush = win32gui.CreateSolidBrush(win32api.RGB(15, 23, 42))  # Slate dark
+                    # Subtle glowing indicator during active drag-hover
+                    brush = win32gui.CreateSolidBrush(win32api.RGB(15, 23, 42))
                     win32gui.FillRect(hdc, rect, brush)
                     win32gui.DeleteObject(brush)
 
-                    # Accent border (#3D8BFF)
                     pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(61, 139, 255))
                     old_pen = win32gui.SelectObject(hdc, pen)
                     null_brush = win32gui.GetStockObject(win32con.NULL_BRUSH)
                     old_brush = win32gui.SelectObject(hdc, null_brush)
-                    win32gui.RoundRect(hdc, 2, 2, rect[2] - 2, rect[3] - 2, 16, 16)
+                    win32gui.RoundRect(hdc, 2, 2, rect[2] - 2, rect[3] - 2, 14, 14)
                     win32gui.SelectObject(hdc, old_pen)
                     win32gui.SelectObject(hdc, old_brush)
                     win32gui.DeleteObject(pen)
 
-                    # Centered drop indicator text
                     win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
                     win32gui.SetTextColor(hdc, win32api.RGB(255, 255, 255))
-                    hint_text = "Release to Convert (Text, Image, Link, File)"
+                    hint_text = "Release to Convert"
                     win32gui.DrawText(
                         hdc,
                         hint_text,
@@ -545,13 +644,13 @@ class NotchDropZoneWindow:
 
         wc = win32gui.WNDCLASS()
         wc.lpfnWndProc = wnd_proc
-        wc.lpszClassName = "NookDropZoneSmart"
+        wc.lpszClassName = "NookDropZoneScoped"
         wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
 
         try:
             atom = win32gui.RegisterClass(wc)
         except Exception:
-            atom = "NookDropZoneSmart"
+            atom = "NookDropZoneScoped"
 
         self.hwnd = win32gui.CreateWindowEx(
             win32con.WS_EX_TOPMOST | win32con.WS_EX_TOOLWINDOW | win32con.WS_EX_LAYERED | win32con.WS_EX_NOACTIVATE,

@@ -306,6 +306,7 @@ def get_available_target_formats(input_info):
             {"id": "pdf", "label": "PDF (.pdf)", "icon": "file-pdf"},
             {"id": "xlsx", "label": "Excel (.xlsx)", "icon": "file-xls"},
             {"id": "txt", "label": "TXT (.txt)", "icon": "file-text"},
+            {"id": "md", "label": "Markdown (.md)", "icon": "file-text"},
             {"id": "png", "label": "Image Card (.png)", "icon": "file-image"},
             {"id": "html", "label": "HTML (.html)", "icon": "code"},
         ]
@@ -1093,6 +1094,10 @@ def execute_conversion(input_obj, target_format, output_dir=None, custom_name=No
                 output_path = text_to_image_card(text, name, output_dir)
             elif target_format == "txt":
                 output_path = text_to_txt(text, name, output_dir)
+            elif target_format == "md":
+                output_path = get_unique_output_path(name, "md", output_dir)
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(text)
             elif target_format == "html":
                 output_path = text_to_html(text, name, output_dir)
 
@@ -1110,6 +1115,10 @@ def execute_conversion(input_obj, target_format, output_dir=None, custom_name=No
                 output_path = text_to_image_card(text, name, output_dir)
             elif target_format == "txt":
                 output_path = text_to_txt(text, name, output_dir)
+            elif target_format == "md":
+                output_path = get_unique_output_path(name, "md", output_dir)
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(text)
             elif target_format == "html":
                 output_path = text_to_html(text, name, output_dir)
 

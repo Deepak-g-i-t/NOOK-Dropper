@@ -413,49 +413,8 @@ def stage_dropped_file(file_path):
         selected_format_idx = 0
         app.active(True)
         app.badge_glyph("lightning")
-        app.show()
+        app.open_page()
         draw()
-
-
-# ---------------------------------------------------------------------------
-# Background Drag Detector (Auto-opens Notch when dragging towards top screen)
-# ---------------------------------------------------------------------------
-
-_last_drag_open = 0.0
-
-def start_drag_listener():
-    """
-    Detects when a user is dragging a file towards the top notch.
-    Automatically slides open Drop Changer's glass page in mid-air so the file
-    can be dropped directly onto the panel without clicking first!
-    """
-    def _drag_loop():
-        global _last_drag_open
-        user32 = ctypes.windll.user32
-
-        class POINT(ctypes.Structure):
-            _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
-
-        pt = POINT()
-        screen_w = user32.GetSystemMetrics(0)
-
-        while True:
-            time.sleep(0.08)
-            try:
-                # Check left mouse button held down (drag in progress)
-                lbutton = user32.GetAsyncKeyState(0x01)
-                if lbutton & 0x8000:
-                    user32.GetCursorPos(ctypes.byref(pt))
-                    # Notch is at top center of screen (y <= 50, within center 50%)
-                    if pt.y <= 50 and (screen_w * 0.25 <= pt.x <= screen_w * 0.75):
-                        now = time.monotonic()
-                        if now - _last_drag_open > 2.0:
-                            _last_drag_open = now
-                            app.show()
-            except Exception:
-                pass
-
-    threading.Thread(target=_drag_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -650,12 +609,22 @@ def on_layout(msg):
 
 @app.on_message("tile_click")
 def on_tile_click(msg):
-    app.show()
+    app.open_page()
 
 
 @app.on_message("hotkey")
 def on_hotkey(msg):
-    app.show()
+    app.open_page()
+
+
+@app.on_message("page_open")
+def on_page_open(msg):
+    pass
+
+
+@app.on_message("page_close")
+def on_page_close(msg):
+    pass
 
 
 @app.on_message("event")
@@ -739,22 +708,19 @@ def on_universal_item_received(item):
         selected_format_idx = 0
         app.active(True)
         app.badge_glyph("lightning")
-        app.show()
+        app.open_page()
         draw()
 
 
 try:
     drop_zone_win = ndt.NotchDropZoneWindow(
         on_item_received=on_universal_item_received,
-        on_open_request=lambda: app.show(),
+        on_open_request=lambda: app.open_page(),
         app_logger=lambda msg, lvl: app.log(msg, lvl)
     )
     drop_zone_win.start()
 except Exception as e:
     app.log(f"Universal drop target init error: {e}", "warn")
-
-# Start background drag listener
-start_drag_listener()
 
 # Initial draw & run
 draw()
